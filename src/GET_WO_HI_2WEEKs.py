@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -54,50 +55,118 @@ def fetch_recent_workouts(days_back: int = DAYS_BACK) -> list[dict]:
 
 
 # ==========================================
-# 2. FORMAT TELEMETRY REPORT
+# 2. FIELD EXTRACTORS & REPORT BUILDER
 # ==========================================
-def format_workout_report(workouts: list[dict], days_back: int = DAYS_BACK) -> str:
-    """Formats workout data into a concise text block under Discord's 2000-char limit."""
-    if not workouts:
-        return f"LYFTA SYNC (Last {days_back} Days)\nNo workouts logged in this window."
+def extract_exercise_name(ex: dict) -> str:
+    """Finds the actual exercise name regardless of Lyfta's nested or flat schema."""
+    # Check common flat keys
+    for key in ("exercise_title", "exercise_name", "title", "name", "exerciseTitle", "exerciseName"):
+        val = ex.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
 
-    lines = [f"LYFTA WORKOUT SYNC (Last {days_back} Days | {len(workouts)} Sessions)", "=" * 48]
+    # Check nested exercise object (e.g., {"exercise": {"title": "Bench Press"}})
+    nested = ex.get("exercise") or ex.get("exercise_info") or ex.get("details")
+    if isinstance(nested, dict):
+        for key in ("title", "name", "exercise_title", "exercise_name"):
+            val = nested.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    elif isinstance(nested, str) and nested.strip():
+        return nested.strip()
+
+    # Fallback: scan any string field with 'name' or 'title' in its key
+    for k, v in ex.items():
+        if ("name" in k.lower() or "title" in k.lower()) and isinstance(v, str) and v.strip():
+            return v.strip()
+
+    return f"Unknown Exercise (keys: {', '.join(ex.keys())})"
+
+
+def format_set(s: dict) -> str:
+    """Formats a single set (weight x reps, bodyweight, or cardio distance/time)."""
+    weight = (
+        s.get("weight")
+        or s.get("weight_lbs")
+        or s.get("weight_kg")
+        or s.get("load")
+    )
+    reps = s.get("reps") or s.get("rep_count")
+    dist = s.get("distance") or s.get("distance_miles") or s.get("distance_km")
+    dur = s.get("duration") or s.get("duration_seconds") or s.get("time")
+
+    if weight is not None and reps is not None:
+        return f"{weight}x{reps}"
+    if reps is not None:
+        return f"BWx{reps}"
+    if dist is not None or dur is not None:
+        parts = [str(p) for p in (dist, dur) if p is not None]
+        return " / ".join(parts)
+    return ""
+
+
+def build_discord_chunks(workouts: list[dict], days_back: int = DAYS_BACK, max_len: int = 1900) -> list[str]:
+    """Builds one or more <=1900-char text blocks so every workout and exercise is sent."""
+    if not workouts:
+        return [f"LYFTA SYNC (Last {days_back} Days)\nNo workouts logged in this window."]
+
+    header = f"LYFTA WORKOUT SYNC (Last {days_back} Days | {len(workouts)} Sessions)\n" + ("=" * 48)
+    session_blocks = []
 
     for w in workouts:
-        title = w.get("title") or w.get("name") or "Workout"
-        raw_date = str(w.get("date") or w.get("start_time") or w.get("created_at") or "")[:10]
-        lines.append(f"\n[{raw_date}] {title}")
+        title = w.get("title") or w.get("name") or w.get("workout_title") or "Workout"
+        raw_date = str(
+            w.get("date")
+            or w.get("workout_date")
+            or w.get("start_time")
+            or w.get("created_at")
+            or ""
+        )[:10]
 
-        for ex in w.get("exercises", []):
-            ex_name = ex.get("title") or ex.get("name") or "Exercise"
-            sets = ex.get("sets", [])
-            set_summaries = []
-            for s in sets:
-                weight = s.get("weight") or s.get("weight_lbs") or s.get("weight_kg")
-                reps = s.get("reps")
-                dist = s.get("distance")
-                dur = s.get("duration")
+        lines = [f"[{raw_date}] {title}"]
+        exercises = w.get("exercises") or w.get("workout_exercises") or []
 
-                if weight is not None and reps is not None:
-                    set_summaries.append(f"{weight}x{reps}")
-                elif reps is not None:
-                    set_summaries.append(f"BWx{reps}")
-                elif dist is not None or dur is not None:
-                    set_summaries.append(f"{dist or ''}/{dur or ''}".strip("/"))
+        for ex in exercises:
+            ex_name = extract_exercise_name(ex)
+            sets = ex.get("sets") or ex.get("workout_sets") or []
+            set_summaries = [formatted for s in sets if (formatted := format_set(s))]
 
             if set_summaries:
                 lines.append(f"  - {ex_name}: {', '.join(set_summaries)}")
             else:
                 lines.append(f"  - {ex_name} ({len(sets)} sets)")
 
-    report = "\n".join(lines)
+        session_blocks.append("\n".join(lines))
 
-    # Discord enforces a strict 2000-character limit on 'content' (including ```text\n...\n```)
-    max_len = 1900
-    if len(report) > max_len:
-        report = report[:max_len] + "\n... [truncated — see local JSON for full log]"
+    # Pack session blocks into Discord-safe chunks without cutting off exercises
+    chunks = []
+    current_chunk = header
 
-    return report
+    for block in session_blocks:
+        candidate = f"{current_chunk}\n\n{block}"
+        if len(candidate) <= max_len:
+            current_chunk = candidate
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            # If a single massive workout exceeds max_len on its own, split by line
+            if len(block) > max_len:
+                sub_lines = block.splitlines()
+                sub_chunk = sub_lines[0]
+                for line in sub_lines[1:]:
+                    if len(sub_chunk) + len(line) + 1 <= max_len:
+                        sub_chunk += f"\n{line}"
+                    else:
+                        chunks.append(sub_chunk)
+                        sub_chunk = f"{sub_lines[0]} (cont.)\n{line}"
+                current_chunk = sub_chunk
+            else:
+                current_chunk = block
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
 
 
 # ==========================================
@@ -134,8 +203,12 @@ def main() -> None:
     output_file.write_text(json.dumps(workouts, indent=2), encoding="utf-8")
     print(f"[*] Saved {len(workouts)} workouts to {output_file}")
 
-    report = format_workout_report(workouts)
-    send_discord_webhook(report)
+    chunks = build_discord_chunks(workouts)
+    for idx, chunk in enumerate(chunks, start=1):
+        print(f"[*] Dispatching Discord message {idx}/{len(chunks)}...")
+        send_discord_webhook(chunk)
+        if idx < len(chunks):
+            time.sleep(1.0)  # Avoid Discord webhook rate limits
 
 
 if __name__ == "__main__":
